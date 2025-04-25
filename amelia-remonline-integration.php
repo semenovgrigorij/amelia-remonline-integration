@@ -1625,12 +1625,11 @@ function map_remonline_status_to_amelia($remonline_status_id) {
     // Здесь нужно описать соответствие статусов Remonline статусам Amelia
     // ID статусов Remonline должны быть корректными для вашей системы
     $status_map = array(
-    	'1642511' => 'pending',    // Начальный статус -> Ожидание в Amelia
-        '1342663' => 'pending',    // Автозапис -> Ожидание в Amelia
-        '1342661' => 'approved',   // В работе -> Подтверждено в Amelia
-        '1642513' => 'canceled',   // Отменено в Remonline -> Отменено в Amelia
-        '1642514' => 'rejected',   // Отклонено в Remonline -> Отклонено в Amelia
-        '1642515' => 'completed'   // Выполнено в Remonline -> Завершено в Amelia
+        '1642511' => 'pending',    // Автозапис -> Ожидание в Amelia
+        '1342663' => 'approved',   // В работе -> Подтверждено в Amelia
+        // '1642513' => 'canceled',   // Отменено в Remonline -> Отменено в Amelia
+        '1342652' => 'rejected',   // Отклонено в Remonline -> Отклонено в Amelia
+        // '1642515' => 'completed'   // Выполнено в Remonline -> Завершено в Amelia
     );
     
     return isset($status_map[$remonline_status_id]) ? $status_map[$remonline_status_id] : 'pending';
