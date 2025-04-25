@@ -94,7 +94,7 @@ class Amelia_Remonline_Integration
     /**
      * Добавляет запись в лог
      */
-    private function log($message, $type = 'info')
+    public function log($message, $type = 'info')
     {
         $log_file = WP_CONTENT_DIR . '/remonline-logs/integration.log';
         $date = date('[Y-m-d H:i:s]');
@@ -295,6 +295,14 @@ class Amelia_Remonline_Integration
                                 <option value="error" <?php selected(get_option('remonline_log_level', 'error'), 'error'); ?>>
                                     Тільки помилки</option>
                             </select>
+                        </td>
+                    </tr>
+                    <tr valign="top">
+                    	<th scope="row">Секретний ключ для вебхуків</th>
+                        <td>
+                        	<input type="text" name="remonline_webhook_secret"
+                            	value="<?php echo esc_attr(get_option('remonline_webhook_secret')); ?>" class="regular-text" />
+                            <p class="description">Цей ключ використовується для безпечної авторизації вебхуків від Remonline</p>
                         </td>
                     </tr>
                 </table>
@@ -1177,6 +1185,25 @@ private function generate_phone_variants($phone) {
     }
 }
 
+function update_amelia_with_remonline_id($amelia_appointment_id, $remonline_order_id) {
+    global $wpdb;
+    $result = $wpdb->update(
+        $wpdb->prefix . 'amelia_appointments',
+        ['externalId' => $remonline_order_id], // Данные для обновления
+        ['id' => $amelia_appointment_id],      // Условие WHERE
+        ['%s'],                                // Формат данных
+        ['%d']                                 // Формат условия
+    );
+    
+    if ($result === false) {
+        // Логирование ошибки
+        error_log("Ошибка при обновлении externalId для записи #$amelia_appointment_id: " . $wpdb->last_error);
+        return false;
+    }
+    
+    return true;
+}
+
 // Инициализация плагина
 // Добавление тестовой функции для проверки срабатывания хука
 add_action('init', function () {
@@ -1472,4 +1499,200 @@ function sync_latest_booking_ajax()
     }
 
     wp_die();
+    
+}
+
+// Добавляем регистрацию REST API эндпоинта
+add_action('rest_api_init', function () {
+    register_rest_route('amelia-remonline/v1', '/update-status', array(
+        'methods' => 'POST',
+        'callback' => 'handle_remonline_status_update',
+        'permission_callback' => function () {
+            return true; // будем проверять секретный ключ внутри функции
+        }
+    ));
+});
+
+/**
+ * Обработчик запросов на обновление статуса заказа из Remonline
+ */
+function handle_remonline_status_update($request) {
+	// Включаем вывод ошибок PHP для отладки
+    ini_set('display_errors', 1);
+    error_reporting(E_ALL);
+    
+    global $amelia_remonline_integration;
+    
+    $params = $request->get_params();
+    $amelia_remonline_integration->log("Получен запрос на обновление статуса: " . 		print_r($params, true), 'debug');
+    
+    // Дополнительные проверки перед обработкой
+    if (!isset($params['secret'])) {
+        $amelia_remonline_integration->log("Отсутствует параметр secret", 'error');
+        return new WP_Error('missing_secret', 'Отсутствует параметр secret', 			array('status' => 400));
+    }
+    
+    // Получаем логгер из глобального объекта плагина
+    global $amelia_remonline_integration;
+    
+	    // Проверка секретного ключа
+    $webhook_secret = get_option('remonline_webhook_secret', '');
+    $amelia_remonline_integration->log("Сравнение ключей: получено [{$params['secret']}], ожидалось [$webhook_secret]", 'debug');
+    
+    if (empty($webhook_secret) || $params['secret'] !== $webhook_secret) {
+        $amelia_remonline_integration->log("Неверный секретный ключ при попытке обновления статуса", 'error');
+        return new WP_Error('invalid_secret', 'Неверный секретный ключ', array('status' => 403));
+    }
+    
+    // Проверяем наличие необходимых параметров
+    if (empty($params['orderId']) || empty($params['newStatusId'])) {
+        $amelia_remonline_integration->log("Отсутствуют обязательные параметры: orderId или newStatusId", 'error');
+        return new WP_Error('missing_params', 'Отсутствуют обязательные параметры', array('status' => 400));
+    }
+    
+    $remonline_order_id = $params['orderId'];
+    $new_status_id = $params['newStatusId'];
+    
+    $amelia_remonline_integration->log("Получен запрос на обновление статуса для заказа Remonline #$remonline_order_id", 'info');
+    
+    // Ищем соответствующую запись в Amelia по внешнему ID (externalId)
+    global $wpdb;
+    $appointment_id = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}amelia_appointments WHERE externalId = %s",
+            $remonline_order_id
+        )
+    );
+    
+    if (!$appointment_id) {
+        $amelia_remonline_integration->log("Не найдена запись Amelia для заказа Remonline #$remonline_order_id", 'error');
+        return new WP_Error('appointment_not_found', 'Не найдена запись для данного заказа', array('status' => 404));
+    }
+    
+    $amelia_remonline_integration->log("Найдена запись Amelia ID: $appointment_id для заказа Remonline #$remonline_order_id", 'debug');
+    
+    // Определяем статус Amelia на основе статуса Remonline
+    $amelia_status = map_remonline_status_to_amelia($new_status_id);
+    
+    // Обновляем статус бронирования в Amelia
+    $result = update_amelia_appointment_status($appointment_id, $amelia_status);
+    
+    if ($result === false) {
+        $amelia_remonline_integration->log("Ошибка при обновлении статуса для записи Amelia ID: $appointment_id", 'error');
+        return new WP_Error('update_failed', 'Ошибка при обновлении статуса', array('status' => 500));
+    }
+    
+    $amelia_remonline_integration->log("Успешно обновлен статус для записи Amelia ID: $appointment_id на '$amelia_status'", 'info');
+    
+    return array(
+        'success' => true,
+        'message' => "Статус записи #$appointment_id успешно обновлен на '$amelia_status'",
+        'appointment_id' => $appointment_id,
+        'remonline_order_id' => $remonline_order_id,
+    );
+}
+
+/**
+ * Сопоставляет статусы Remonline и Amelia
+ */
+function map_remonline_status_to_amelia($remonline_status_id) {
+    // Здесь нужно описать соответствие статусов Remonline статусам Amelia
+    // ID статусов Remonline должны быть корректными для вашей системы
+    $status_map = array(
+    	'1642511' => 'pending',    // Начальный статус -> Ожидание в Amelia
+        '1342663' => 'pending',    // Автозапис -> Ожидание в Amelia
+        '1342661' => 'approved',   // В работе -> Подтверждено в Amelia
+        '1642513' => 'canceled',   // Отменено в Remonline -> Отменено в Amelia
+        '1642514' => 'rejected',   // Отклонено в Remonline -> Отклонено в Amelia
+        '1642515' => 'completed'   // Выполнено в Remonline -> Завершено в Amelia
+    );
+    
+    return isset($status_map[$remonline_status_id]) ? $status_map[$remonline_status_id] : 'pending';
+}
+
+/**
+ * Обновляет статус записи в Amelia
+ */
+function update_amelia_appointment_status($appointment_id, $status) {
+    global $wpdb;
+    
+    // Проверяем, что статус допустимый
+    $valid_statuses = array('pending', 'approved', 'canceled', 'rejected', 'completed');
+    if (!in_array($status, $valid_statuses)) {
+        return false;
+    }
+    
+    // Обновляем статус записи в таблице amelia_appointments
+    $result = $wpdb->update(
+        $wpdb->prefix . 'amelia_appointments',
+        array('status' => $status),
+        array('id' => $appointment_id)
+    );
+    
+    // Если обновление прошло успешно, обновляем также статус в таблице бронирований
+    if ($result !== false) {
+        $wpdb->update(
+            $wpdb->prefix . 'amelia_customer_bookings',
+            array('status' => $status),
+            array('appointmentId' => $appointment_id)
+        );
+        
+        // Вызываем хук Amelia для обработки изменения статуса
+        do_action('amelia_appointment_status_changed', $appointment_id, $status);
+        
+        return true;
+    }
+    
+    return false;
+}
+
+// Добавляем новое поле в настройки плагина для секретного ключа вебхука
+add_action('admin_init', function() {
+    register_setting('amelia_remonline_settings', 'remonline_webhook_secret', array(
+        'default' => wp_generate_password(20, false)
+    ));
+});
+
+// Добавляем регистрацию REST API эндпоинта для проверки
+add_action('rest_api_init', function () {
+    register_rest_route('amelia-remonline/v1', '/check-appointment', array(
+        'methods' => 'GET',
+        'callback' => 'check_appointment_exists',
+        'permission_callback' => function () {
+            return true;
+        }
+    ));
+});
+
+/**
+ * Проверяет существование записи в Amelia по внешнему ID
+ */
+function check_appointment_exists($request) {
+    $params = $request->get_params();
+    
+    // Получаем логгер из глобального объекта плагина
+    global $amelia_remonline_integration;
+    
+    // Проверяем секретный ключ для безопасности
+    if (empty($params['secret']) || $params['secret'] !== get_option('remonline_webhook_secret', '')) {
+        return new WP_Error('invalid_secret', 'Неверный секретный ключ', array('status' => 403));
+    }
+    
+    if (empty($params['external_id'])) {
+        return new WP_Error('missing_params', 'Отсутствует параметр external_id', array('status' => 400));
+    }
+    
+    // Ищем соответствующую запись в Amelia по внешнему ID
+    global $wpdb;
+    $appointment_id = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}amelia_appointments WHERE externalId = %s",
+            $params['external_id']
+        )
+    );
+    
+    return array(
+        'exists' => !empty($appointment_id),
+        'appointment_id' => $appointment_id ? intval($appointment_id) : null
+    );
 }
