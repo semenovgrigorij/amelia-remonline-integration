@@ -450,6 +450,7 @@ public function handle_appointment_created($appointmentId, $appointmentData)
         }
 
         $this->log("Успішно створено замовлення (ID: $order_id) у Remonline для клієнта (ID: $client_id)", 'info');
+        $this->log("Результат создания заказа в Remonline: " . ($order_id ? "успешно, ID: $order_id" : "ошибка"), $order_id ? 'info' : 'error');
 
         // Сохраняем ID созданного заказа в Remonline в метаданных записи Amelia
         global $wpdb;
@@ -458,6 +459,31 @@ public function handle_appointment_created($appointmentId, $appointmentData)
             array('externalId' => $order_id),
             array('id' => $appointmentId)
         );
+
+        $update_result = $wpdb->update(
+            $wpdb->prefix . 'amelia_appointments',
+            array('externalId' => $order_id),
+            array('id' => $appointmentId)
+        );
+        
+        if ($update_result === false) {
+            $this->log("Ошибка при обновлении externalId в базе данных: " . $wpdb->last_error, 'error');
+        } else {
+            $this->log("externalId в базе данных успешно обновлен: $order_id для записи $appointmentId", 'info');
+        }
+
+        // Перед обновлением базы данных
+        $this->log("Пытаемся обновить externalId: $order_id для записи: $appointmentId", 'debug');
+
+        // После обновления проверьте, что запись действительно обновлена
+        $check_id = $wpdb->get_var(
+            $wpdb->prepare(
+            "SELECT externalId FROM {$wpdb->prefix}amelia_appointments WHERE id = %d",
+            $appointmentId
+            )
+        );
+
+        $this->log("После обновления базы данных, значение externalId: $check_id", 'debug');
 
         return true;
     } catch (Exception $e) {
@@ -1180,7 +1206,7 @@ private function generate_phone_variants($phone) {
             $order_id = $response_data['data']['id'];
         
             return $order_id;
-        }  
+        }
         return null;
     }
 }
