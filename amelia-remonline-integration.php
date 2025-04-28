@@ -1138,16 +1138,16 @@ private function generate_phone_variants($phone) {
             'status' => 1642511,
             'email' => $customer['email'],
             'client_id' => $client_id,
-            // 'manager' => 268918,
+            'manager' => 268918,
             // 'asset_id' => 6083062,
             // 'malfunction' => $malfunction,
-            // 'duration' => $service['duration'] ? intval($service['duration']) : 60,
+            'duration' => $service['duration'] ? intval($service['duration']) : 60,
             'scheduled_for' => $bookingStart, // Метка времени в миллисекундах
-            // 'custom_fields' => array(
-            //     'f5370833' => 'Зовнішній клієнт',
+            'custom_fields' => array(
+                'f5370833' => 'Потенційний клієнт',
             //     'f5294177' => "01_Зовнішній Клієнт СТО G CAR (Київ)",
-            //     'f5294178' => $appointment['id'] // Используем ID записи в Amelia как референс
-            // ),
+                'f5294178' => $appointment['id'], // Используем ID записи в Amelia как референс
+            ),
             'ad_campaign_id' => 301120
         );
 
