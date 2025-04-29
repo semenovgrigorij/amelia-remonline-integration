@@ -1748,24 +1748,6 @@ function sync_latest_booking_ajax()
     
 }
 
-// Добавляем регистрацию REST API эндпоинта
-add_action('rest_api_init', function () {
-    register_rest_route('amelia-remonline/v1', '/update-status', array(
-        'methods' => 'POST',
-        'callback' => 'handle_remonline_status_update',
-        'permission_callback' => function () {
-            return true; // будем проверять секретный ключ внутри функции
-        }
-    ));
-
-    register_rest_route('amelia-remonline/v1', '/update-datetime', array(
-        'methods' => 'POST',
-        'callback' => 'handle_remonline_datetime_update',
-        'permission_callback' => function () {
-            return true; // будем проверять секретный ключ внутри функции
-        }
-    ));
-});
 
 /**
  * Обработчик запросов на обновление статуса заказа из Remonline
@@ -1973,24 +1955,10 @@ function update_amelia_appointment_datetime($appointment_id, $timestamp_ms) {
     // Конвертируем метку времени из миллисекунд в секунды
     $timestamp_sec = intval($timestamp_ms) / 1000;
     
-    // Получаем часовой пояс WordPress
-    $timezone_string = get_option('timezone_string');
-    $timezone = new DateTimeZone($timezone_string ?: 'UTC');
+    // Форматируем дату в MySQL формат в UTC (без коррекции часового пояса)
+    $mysql_datetime = gmdate('Y-m-d H:i:s', $timestamp_sec);
     
-    // Преобразуем timestamp в DateTime и устанавливаем часовой пояс
-    $date = new DateTime('@' . $timestamp_sec);
-    $date->setTimezone($timezone);
-    
-    // Форматируем дату в MySQL формат с учетом часового пояса
-    $mysql_datetime = $date->format('Y-m-d H:i:s');
-    
-    $amelia_remonline_integration->log("Обновление времени записи ID: $appointment_id на $mysql_datetime (из timestamp: $timestamp_ms)", 'debug');
-    $amelia_remonline_integration->log(
-        "Преобразование времени: timestamp=$timestamp_ms, UTC=" . gmdate('Y-m-d H:i:s', $timestamp_sec) . 
-        ", Local=" . date('Y-m-d H:i:s', $timestamp_sec) . 
-        ", WordPress timezone=" . $timezone_string,
-        'debug'
-    );
+    $amelia_remonline_integration->log("Обновление времени записи ID: $appointment_id на $mysql_datetime (UTC) из timestamp: $timestamp_ms", 'debug');
     
     // Получаем текущие данные записи
     $appointment = $wpdb->get_row(
@@ -2017,12 +1985,19 @@ function update_amelia_appointment_datetime($appointment_id, $timestamp_ms) {
         }
     }
     
-    // Создаем копию даты для времени окончания и добавляем продолжительность
-    $end_date = clone $date;
-    $end_date->add(new DateInterval('PT' . $duration . 'M')); // PT60M = 60 минут
-    $end_datetime = $end_date->format('Y-m-d H:i:s');
+    // Рассчитываем время окончания (тоже в UTC)
+    $end_timestamp = $timestamp_sec + ($duration * 60);
+    $end_datetime = gmdate('Y-m-d H:i:s', $end_timestamp);
     
-    // Обновляем запись в базе данных
+    // Добавим дебаг-информацию
+    $timezone_string = get_option('timezone_string');
+    $amelia_remonline_integration->log(
+        "Информация о времени: timestamp_ms=$timestamp_ms, UTC_start=$mysql_datetime, UTC_end=$end_datetime, " . 
+        "WP_timezone=$timezone_string, Local_time=" . date('Y-m-d H:i:s', $timestamp_sec),
+        'debug'
+    );
+    
+    // Обновляем запись в базе данных (сохраняем в UTC)
     $result = $wpdb->update(
         $wpdb->prefix . 'amelia_appointments',
         array(
@@ -2037,7 +2012,7 @@ function update_amelia_appointment_datetime($appointment_id, $timestamp_ms) {
         return false;
     }
     
-    $amelia_remonline_integration->log("Успешно обновлено время записи ID: $appointment_id на $mysql_datetime (окончание: $end_datetime)", 'info');
+    $amelia_remonline_integration->log("Успешно обновлено время записи ID: $appointment_id на $mysql_datetime (UTC) с окончанием: $end_datetime (UTC)", 'info');
     
     // Вызываем хук Amelia для уведомления об изменении расписания
     do_action('amelia_appointment_time_updated', $appointment_id, $mysql_datetime, $end_datetime);
@@ -2054,44 +2029,337 @@ add_action('admin_init', function() {
 
 // Добавляем регистрацию REST API эндпоинта для проверки
 add_action('rest_api_init', function () {
+    // Endpoint для проверки наличия записи в Amelia
     register_rest_route('amelia-remonline/v1', '/check-appointment', array(
         'methods' => 'GET',
         'callback' => 'check_appointment_exists',
-        'permission_callback' => function () {
-            return true;
-        }
+        'permission_callback' => '__return_true'
+    ));
+
+    // Endpoint для обновления статуса
+    register_rest_route('amelia-remonline/v1', '/update-status', array(
+        'methods' => 'POST',
+        'callback' => 'update_appointment_status',
+        'permission_callback' => '__return_true'
+    ));
+
+    // Endpoint для обновления даты/времени
+    register_rest_route('amelia-remonline/v1', '/update-datetime', array(
+        'methods' => 'POST',
+        'callback' => 'update_appointment_datetime',
+        'permission_callback' => '__return_true'
+    ));
+
+    // Endpoint для получения токена
+    register_rest_route('amelia-remonline/v1', '/get-token', array(
+        'methods' => 'GET',
+        'callback' => 'get_remonline_token',
+        'permission_callback' => '__return_true'
     ));
 });
 
 /**
- * Проверяет существование записи в Amelia по внешнему ID
+ * Обработчик запроса на получение актуального токена Remonline
  */
-function check_appointment_exists($request) {
-    $params = $request->get_params();
-    
-    // Получаем логгер из глобального объекта плагина
+function handle_get_token_request($request) {
     global $amelia_remonline_integration;
     
-    // Проверяем секретный ключ для безопасности
+    $params = $request->get_params();
+    
+    // Проверка секретного ключа
     if (empty($params['secret']) || $params['secret'] !== get_option('remonline_webhook_secret', '')) {
+        $amelia_remonline_integration->log("Неверный секретный ключ при запросе токена", 'error');
         return new WP_Error('invalid_secret', 'Неверный секретный ключ', array('status' => 403));
     }
     
-    if (empty($params['external_id'])) {
-        return new WP_Error('missing_params', 'Отсутствует параметр external_id', array('status' => 400));
+    $token = get_option('remonline_api_token', '');
+    $expiry = get_option('remonline_token_expiry', 0);
+    
+    // Если токен просрочен или скоро истечет, обновляем его
+    if (time() > $expiry - 3600) { // за 1 час до истечения
+        $amelia_remonline_integration->log("Токен просрочен или скоро истечет, обновляем", 'info');
+        $token = $amelia_remonline_integration->update_token();
     }
     
-    // Ищем соответствующую запись в Amelia по внешнему ID
-    global $wpdb;
-    $appointment_id = $wpdb->get_var(
-        $wpdb->prepare(
-            "SELECT id FROM {$wpdb->prefix}amelia_appointments WHERE externalId = %s",
-            $params['external_id']
-        )
-    );
+    if (empty($token)) {
+        $amelia_remonline_integration->log("Не удалось получить или обновить токен", 'error');
+        return new WP_Error('token_error', 'Не удалось получить или обновить токен', array('status' => 500));
+    }
     
     return array(
-        'exists' => !empty($appointment_id),
-        'appointment_id' => $appointment_id ? intval($appointment_id) : null
+        'success' => true,
+        'token' => $token,
+        'expires' => get_option('remonline_token_expiry', 0)
     );
+}
+
+/**
+ * Проверяет наличие записи с указанным external_id в базе данных Amelia
+ */
+function check_appointment_exists($request) {
+    global $wpdb, $amelia_remonline_integration;
+    
+    $params = $request->get_params();
+    $secret = isset($params['secret']) ? $params['secret'] : '';
+    $external_id = isset($params['external_id']) ? $params['external_id'] : '';
+    
+    // Проверка секретного ключа
+    if ($secret !== get_option('remonline_webhook_secret', '')) {
+        $amelia_remonline_integration->log("Неверный секретный ключ при проверке записи: $external_id", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Неверный секретный ключ'], 403);
+    }
+    
+    if (empty($external_id)) {
+        return new WP_REST_Response(['success' => false, 'message' => 'Не указан ID заказа'], 400);
+    }
+    
+    $amelia_remonline_integration->log("Проверка наличия записи с externalId: $external_id", 'info');
+    
+    $appointment_id = $wpdb->get_var($wpdb->prepare(
+        "SELECT id FROM {$wpdb->prefix}amelia_appointments WHERE externalId = %s LIMIT 1",
+        $external_id
+    ));
+    
+    $exists = !empty($appointment_id);
+    
+    $amelia_remonline_integration->log("Результат проверки записи $external_id: " . ($exists ? "Найдена (ID: $appointment_id)" : "Не найдена"), 'info');
+    
+    return [
+        'success' => true,
+        'exists' => $exists,
+        'appointment_id' => $appointment_id
+    ];
+}
+
+/**
+ * Обновляет статус записи в Amelia
+ */
+function update_appointment_status($request) {
+    global $wpdb, $amelia_remonline_integration;
+    
+    $params = json_decode($request->get_body(), true);
+    
+    $secret = isset($params['secret']) ? $params['secret'] : '';
+    $order_id = isset($params['orderId']) ? $params['orderId'] : '';
+    $new_status_id = isset($params['newStatusId']) ? $params['newStatusId'] : '';
+    
+    // Проверка секретного ключа
+    if ($secret !== get_option('remonline_webhook_secret', '')) {
+        $amelia_remonline_integration->log("Неверный секретный ключ при обновлении статуса", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Неверный секретный ключ'], 403);
+    }
+    
+    if (empty($order_id) || empty($new_status_id)) {
+        $amelia_remonline_integration->log("Недостаточно данных для обновления статуса", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Недостаточно данных'], 400);
+    }
+    
+    $amelia_remonline_integration->log("Запрос на обновление статуса для заказа $order_id на статус $new_status_id", 'info');
+    
+    // Получаем ID записи по внешнему ID
+    $appointment_id = $wpdb->get_var($wpdb->prepare(
+        "SELECT id FROM {$wpdb->prefix}amelia_appointments WHERE externalId = %s LIMIT 1",
+        $order_id
+    ));
+    
+    if (!$appointment_id) {
+        $amelia_remonline_integration->log("Запись для заказа $order_id не найдена в Amelia", 'error');
+        return new WP_REST_Response([
+            'success' => false, 
+            'message' => "Запись для заказа $order_id не найдена в Amelia"
+        ], 404);
+    }
+    
+    // Определяем статус Amelia на основе статуса Remonline
+    $amelia_status = 'pending'; // По умолчанию
+    
+    // Статусы Remonline
+    $IN_PROGRESS_STATUS_ID = '1342663'; // "Новий"
+    $AUTO_APPOINTMENT_STATUS_ID = '1642511'; // "Автозапис"
+    $COMPLETED_STATUS_ID = '1342658'; // "Выполнен"
+    $CANCELED_STATUS_ID = '1342652'; // "Отменен"
+    
+    // Маппинг статусов Remonline -> Amelia
+    switch ($new_status_id) {
+        case $IN_PROGRESS_STATUS_ID: // "Новий"
+            $amelia_status = 'approved'; // Подтвержден
+            break;
+        case $COMPLETED_STATUS_ID: // "Выполнен"
+            $amelia_status = 'approved'; // или другой подходящий статус
+            break;
+        case $CANCELED_STATUS_ID: // "Отменен"
+            $amelia_status = 'canceled'; // Отменен
+            break;
+        case $AUTO_APPOINTMENT_STATUS_ID: // "Автозапис"
+            $amelia_status = 'pending'; // Ожидает
+            break;
+        default:
+            $amelia_status = 'pending';
+    }
+    
+    $amelia_remonline_integration->log("Преобразование статуса Remonline $new_status_id в статус Amelia: $amelia_status", 'info');
+    
+    // Обновляем статус в БД
+    $result = $wpdb->update(
+        $wpdb->prefix . 'amelia_appointments',
+        ['status' => $amelia_status],
+        ['id' => $appointment_id]
+    );
+    
+    if ($result === false) {
+        $amelia_remonline_integration->log("Ошибка при обновлении статуса: " . $wpdb->last_error, 'error');
+        return new WP_REST_Response([
+            'success' => false, 
+            'message' => "Ошибка при обновлении статуса: " . $wpdb->last_error
+        ], 500);
+    }
+    
+    $amelia_remonline_integration->log("Статус записи #$appointment_id успешно обновлен на $amelia_status", 'info');
+    
+    // Вызываем хук Amelia для уведомления о смене статуса
+    do_action('amelia_appointment_status_changed', $appointment_id, $amelia_status);
+    
+    return [
+        'success' => true,
+        'message' => "Статус успешно обновлен на $amelia_status",
+        'appointment_id' => $appointment_id,
+        'status' => $amelia_status
+    ];
+}
+
+/**
+ * Возвращает текущий токен Remonline API
+ */
+function get_remonline_token($request) {
+    global $amelia_remonline_integration;
+    
+    $params = $request->get_params();
+    $secret = isset($params['secret']) ? $params['secret'] : '';
+    
+    // Проверка секретного ключа
+    if ($secret !== get_option('remonline_webhook_secret', '')) {
+        $amelia_remonline_integration->log("Неверный секретный ключ при запросе токена", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Неверный секретный ключ'], 403);
+    }
+    
+    $token = get_option('remonline_api_token', '');
+    $expiry = intval(get_option('remonline_token_expiry', 0));
+    
+    // Если токен устарел или скоро истечет, обновляем его
+    if (empty($token) || time() > $expiry - 1800) { // Обновляем, если осталось менее 30 минут
+        $amelia_remonline_integration->log("Обновление истекающего токена", 'info');
+        $token = $amelia_remonline_integration->update_token();
+        $expiry = intval(get_option('remonline_token_expiry', 0));
+    }
+    
+    if (empty($token)) {
+        $amelia_remonline_integration->log("Не удалось получить токен API", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Не удалось получить токен API'], 500);
+    }
+    
+    return [
+        'success' => true,
+        'token' => $token,
+        'expires' => $expiry
+    ];
+}
+
+/**
+ * Обновляет дату и время записи в Amelia
+ */
+function update_appointment_datetime($request) {
+    global $wpdb, $amelia_remonline_integration;
+    
+    $params = json_decode($request->get_body(), true);
+    
+    $secret = isset($params['secret']) ? $params['secret'] : '';
+    $order_id = isset($params['orderId']) ? $params['orderId'] : '';
+    $scheduled_for = isset($params['scheduledFor']) ? $params['scheduledFor'] : 0;
+    
+    // Проверка секретного ключа
+    if ($secret !== get_option('remonline_webhook_secret', '')) {
+        $amelia_remonline_integration->log("Неверный секретный ключ при обновлении времени", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Неверный секретный ключ'], 403);
+    }
+    
+    if (empty($order_id) || empty($scheduled_for)) {
+        $amelia_remonline_integration->log("Недостаточно данных для обновления времени", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Недостаточно данных'], 400);
+    }
+    
+    $scheduled_time = intval($scheduled_for);
+    if ($scheduled_time <= 0) {
+        $amelia_remonline_integration->log("Некорректное время для обновления: $scheduled_time", 'error');
+        return new WP_REST_Response(['success' => false, 'message' => 'Некорректное время'], 400);
+    }
+    
+    $amelia_remonline_integration->log("Запрос на обновление времени для заказа $order_id на " . date('Y-m-d H:i:s', $scheduled_time/1000), 'info');
+    
+    // Получаем ID записи по внешнему ID
+    $appointment_id = $wpdb->get_var($wpdb->prepare(
+        "SELECT id FROM {$wpdb->prefix}amelia_appointments WHERE externalId = %s LIMIT 1",
+        $order_id
+    ));
+    
+    if (!$appointment_id) {
+        $amelia_remonline_integration->log("Запись для заказа $order_id не найдена в Amelia", 'error');
+        return new WP_REST_Response([
+            'success' => false, 
+            'message' => "Запись для заказа $order_id не найдена в Amelia"
+        ], 404);
+    }
+    
+    // Получаем информацию о записи
+    $appointment = $wpdb->get_row($wpdb->prepare(
+        "SELECT * FROM {$wpdb->prefix}amelia_appointments WHERE id = %d",
+        $appointment_id
+    ));
+    
+    if (!$appointment) {
+        $amelia_remonline_integration->log("Ошибка при получении данных записи #$appointment_id", 'error');
+        return new WP_REST_Response([
+            'success' => false, 
+            'message' => "Ошибка при получении данных записи"
+        ], 500);
+    }
+    
+    // Преобразуем время из миллисекунд в MySQL datetime формат (UTC)
+    $mysql_datetime = date('Y-m-d H:i:s', $scheduled_time/1000);
+    
+    // Рассчитываем новое время окончания (сохраняем исходную длительность)
+    $duration = strtotime($appointment->bookingEnd) - strtotime($appointment->bookingStart);
+    $new_end_time = date('Y-m-d H:i:s', $scheduled_time/1000 + $duration);
+    
+    $amelia_remonline_integration->log("Обновление времени записи #$appointment_id: $mysql_datetime - $new_end_time", 'info');
+    
+    // Обновляем время в БД
+    $result = $wpdb->update(
+        $wpdb->prefix . 'amelia_appointments',
+        [
+            'bookingStart' => $mysql_datetime,
+            'bookingEnd' => $new_end_time
+        ],
+        ['id' => $appointment_id]
+    );
+    
+    if ($result === false) {
+        $amelia_remonline_integration->log("Ошибка при обновлении времени: " . $wpdb->last_error, 'error');
+        return new WP_REST_Response([
+            'success' => false, 
+            'message' => "Ошибка при обновлении времени: " . $wpdb->last_error
+        ], 500);
+    }
+    
+    $amelia_remonline_integration->log("Время записи #$appointment_id успешно обновлено", 'info');
+    
+    // Вызываем хук Amelia для уведомления о изменении времени
+    do_action('amelia_appointment_time_updated', $appointment_id);
+    
+    return [
+        'success' => true,
+        'message' => "Время успешно обновлено",
+        'appointment_id' => $appointment_id,
+        'new_start' => $mysql_datetime,
+        'new_end' => $new_end_time
+    ];
 }
