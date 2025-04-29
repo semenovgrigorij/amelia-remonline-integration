@@ -489,6 +489,8 @@ public function handle_appointment_created($appointmentId, $appointmentData)
     } catch (Exception $e) {
         $this->log("Помилка при обробці бронювання: " . $e->getMessage(), 'error');
         return false;
+    } finally {
+        $this->release_lock($appointmentId); // Освобождаем блокировку в любом случае
     }
 }
 
