@@ -383,6 +383,104 @@ private function release_lock($appointmentId) {
     delete_transient($lock_key);
 }
 
+/**
+ * Обновляет externalId с надежной обработкой ошибок
+ * @param int $amelia_appointment_id ID записи в Amelia
+ * @param string $remonline_order_id ID заказа в Remonline
+ * @return bool Результат операции
+ */
+private function update_appointment_external_id($amelia_appointment_id, $remonline_order_id) {
+    global $wpdb;
+    
+    if (empty($amelia_appointment_id) || empty($remonline_order_id)) {
+        $this->log("Ошибка: пустые параметры при обновлении externalId", 'error');
+        return false;
+    }
+    
+    // Проверяем, существует ли запись
+    $exists = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}amelia_appointments WHERE id = %d",
+            $amelia_appointment_id
+        )
+    );
+    
+    if (!$exists) {
+        $this->log("Ошибка: попытка обновить несуществующую запись ID: $amelia_appointment_id", 'error');
+        return false;
+    }
+    
+    // Сначала проверяем текущее значение, чтобы не обновлять без необходимости
+    $current_external_id = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT externalId FROM {$wpdb->prefix}amelia_appointments WHERE id = %d",
+            $amelia_appointment_id
+        )
+    );
+    
+    // Если значение уже установлено и совпадает - не обновляем
+    if ($current_external_id === $remonline_order_id) {
+        $this->log("externalId уже установлен в $remonline_order_id для записи $amelia_appointment_id", 'debug');
+        return true;
+    }
+    
+    // Выполняем обновление
+    $update_result = $wpdb->update(
+        $wpdb->prefix . 'amelia_appointments',
+        array('externalId' => $remonline_order_id),
+        array('id' => $amelia_appointment_id),
+        array('%s'),  // Формат данных
+        array('%d')   // Формат условия
+    );
+    
+    // Проверяем результат обновления
+    if ($update_result === false) {
+        $db_error = $wpdb->last_error;
+        $this->log("Ошибка SQL при обновлении externalId: $db_error", 'error');
+        
+        // Попытка выяснить причину ошибки
+        if (empty($db_error)) {
+            // Проверим на возможное повреждение таблицы
+            $table_status = $wpdb->get_row("CHECK TABLE {$wpdb->prefix}amelia_appointments");
+            if ($table_status && $table_status->Msg_text !== 'OK') {
+                $this->log("Возможное повреждение таблицы: {$table_status->Msg_text}", 'error');
+            }
+            
+            // Проверим структуру таблицы
+            $has_external_id_column = $wpdb->get_var(
+                "SHOW COLUMNS FROM {$wpdb->prefix}amelia_appointments LIKE 'externalId'"
+            );
+            
+            if (!$has_external_id_column) {
+                $this->log("Критическая ошибка: поле externalId не существует в таблице", 'error');
+                return false;
+            }
+        }
+        
+        return false;
+    } elseif ($update_result === 0) {
+        // Запись не изменилась (возможно, значение уже было таким)
+        $this->log("Запись $amelia_appointment_id не изменилась при обновлении externalId", 'info');
+    } else {
+        $this->log("Успешно обновлен externalId: $remonline_order_id для записи $amelia_appointment_id", 'info');
+    }
+    
+    // После обновления проверяем, что запись действительно обновлена
+    $check_id = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT externalId FROM {$wpdb->prefix}amelia_appointments WHERE id = %d",
+            $amelia_appointment_id
+        )
+    );
+    
+    if ($check_id != $remonline_order_id) {
+        $this->log("Ошибка проверки после обновления: externalId = $check_id, ожидалось $remonline_order_id", 'error');
+        return false;
+    }
+    
+    return true;
+}
+
 public function handle_appointment_created($appointmentId, $appointmentData)
 {
     if (!$this->acquire_lock($appointmentId)) {
@@ -453,12 +551,12 @@ public function handle_appointment_created($appointmentId, $appointmentData)
         $this->log("Результат создания заказа в Remonline: " . ($order_id ? "успешно, ID: $order_id" : "ошибка"), $order_id ? 'info' : 'error');
 
         // Сохраняем ID созданного заказа в Remonline в метаданных записи Amelia
-        global $wpdb;
-        $wpdb->update(
-            $wpdb->prefix . 'amelia_appointments',
-            array('externalId' => $order_id),
-            array('id' => $appointmentId)
-        );
+        $update_result = $this->update_appointment_external_id($appointmentId, $order_id);
+        
+        if (!$update_result) {
+            $this->log("Не удалось обновить externalId для записи $appointmentId", 'error');
+            // Но продолжаем выполнение, так как заказ в Remonline уже создан
+        }
 
         $update_result = $wpdb->update(
             $wpdb->prefix . 'amelia_appointments',
@@ -885,30 +983,6 @@ private function deep_client_search($email, $phone, $api_token) {
     return null;
 }
 
-private function search_client_api($params, $api_token) {
-    $curl = curl_init();
-    $query = http_build_query($params);
-    $url = "https://api.remonline.app/clients/?token=$api_token&$query";
-    
-    curl_setopt_array($curl, [
-        CURLOPT_URL => $url,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 30,
-        CURLOPT_HTTPHEADER => ["accept: application/json"],
-    ]);
-    
-    $response = curl_exec($curl);
-    $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    curl_close($curl);
-    
-    if ($http_code != 200) {
-        $this->log("Ошибка API: $http_code, URL: $url", 'error');
-        return [];
-    }
-    
-    $data = json_decode($response, true);
-    return $data['data'] ?? [];
-}
 private function normalize_phone($phone) {
     // Удаляем все нецифровые символы
     $digits = preg_replace('/[^0-9]/', '', $phone);
@@ -925,72 +999,232 @@ private function normalize_phone($phone) {
     return $digits;
 }
 
+/**
+ *  Поиск клиента по email и телефону
+ */
 private function find_client_with_full_check($email, $phone, $api_token) {
-    // Получаем всех клиентов
-    $all_clients = $this->get_all_clients($api_token);
-    
-    foreach ($all_clients as $client) {
-        // Проверка email
-        $client_email = strtolower(trim($client['email'] ?? ''));
-        $email_match = !empty($email) && $client_email === $email;
+    // Если есть точные параметры поиска - используем их
+    if (!empty($email) || !empty($phone)) {
+        // Сначала поиск по точным параметрам
+        $search_params = [];
+        if (!empty($email)) $search_params['email'] = $email;
+        if (!empty($phone)) $search_params['phone'] = $phone;
+
+        $found_clients = $this->search_client_api($search_params, $api_token);
+        $this->log("Поиск клиента по параметрам: " . json_encode($search_params) . ", найдено: " . count($found_clients), 'debug');
         
-        // Проверка телефона
-        $phone_match = false;
-        $client_phones = $client['phone'] ?? [];
-        
-        foreach ($client_phones as $client_phone) {
-            if ($this->normalize_phone($client_phone) === $phone) {
-                $phone_match = true;
-                break;
+        // Проверяем точное совпадение
+        foreach ($found_clients as $client) {
+            // Проверка email
+            $client_email = strtolower(trim($client['email'] ?? ''));
+            $email_match = !empty($email) && $client_email === $email;
+            
+            // Проверка телефона
+            $phone_match = false;
+            if (!empty($phone)) {
+                foreach ($client['phone'] ?? [] as $client_phone) {
+                    if ($this->normalize_phone($client_phone) === $phone) {
+                        $phone_match = true;
+                        break;
+                    }
+                }
+            }
+            
+            // Если найдено совпадение
+            if ($email_match || $phone_match) {
+                $this->log("Найден клиент ID: {$client['id']} с точным совпадением", 'debug');
+                return $client['id'];
             }
         }
         
-        // Если найдено совпадение
-        if ($email_match || $phone_match) {
-            $this->log("Точное совпадение с клиентом ID: {$client['id']}", 'debug');
-            $this->log("Данные клиента: " . json_encode([
-                'id' => $client['id'],
-                'name' => $client['name'] ?? '',
-                'email' => $client_email,
-                'phones' => $client_phones
-            ]), 'debug');
+        // Проверим совпадение по последним цифрам телефона, если не найдено точное
+        if (!empty($phone)) {
+            $last_digits = substr($this->normalize_phone($phone), -9); // Последние 9 цифр
+            if (strlen($last_digits) >= 9) {
+                foreach ($found_clients as $client) {
+                    foreach ($client['phone'] ?? [] as $client_phone) {
+                        $normalized_client_phone = $this->normalize_phone($client_phone);
+                        if (substr($normalized_client_phone, -9) === $last_digits) {
+                            $this->log("Найден клиент ID: {$client['id']} по последним цифрам телефона", 'debug');
+                            return $client['id'];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Если не нашли по точным параметрам, пробуем расширенный поиск по тексту
+    if (!empty($email) || !empty($phone) || !empty($name)) {
+        $query_text = '';
+        if (!empty($phone)) {
+            // Используем последние 6 цифр телефона для поиска
+            $query_text = substr($this->normalize_phone($phone), -6);
+        } else if (!empty($email)) {
+            $query_text = $email;
+        }
+        
+        if (!empty($query_text)) {
+            $text_search_clients = $this->search_client_api(['query' => $query_text], $api_token);
+            $this->log("Текстовый поиск по: $query_text, найдено: " . count($text_search_clients), 'debug');
             
-            return $client['id'];
+            if (!empty($text_search_clients)) {
+                // Берем первый результат - наиболее релевантный
+                $best_match = $text_search_clients[0];
+                $this->log("Лучшее совпадение: {$best_match['id']} ({$best_match['name']})", 'debug');
+                return $best_match['id'];
+            }
         }
     }
     
     return null;
 }
 
+/**
+ * Последняя попытка поиска клиента, используя более агрессивные методы
+ */
 private function ultimate_client_search($email, $phone, $api_token) {
-    $all_clients = $this->get_all_clients($api_token);
-    
-    foreach ($all_clients as $client) {
-        // Проверка email (без учета пустых значений)
-        if (!empty($email)) {
-            $client_email = strtolower(trim($client['email'] ?? ''));
-            if ($client_email === $email) {
-                $this->log("Найден по email: {$client['id']}", 'info');
-                return $client['id'];
+    // 1. Проверяем, есть ли результаты по частичному совпадению телефона
+    if (!empty($phone)) {
+        $phone_variants = $this->generate_phone_variants($phone);
+        
+        foreach ($phone_variants as $variant) {
+            // Ищем по каждому варианту телефона
+            $search_result = $this->search_client_api(['query' => $variant], $api_token);
+            
+            if (!empty($search_result)) {
+                $this->log("Найден клиент по варианту телефона: {$search_result[0]['id']}", 'debug');
+                return $search_result[0]['id'];
             }
         }
         
-        // Проверка всех вариантов телефона
-        foreach ($client['phone'] ?? [] as $client_phone) {
-            $normalized_client_phone = $this->normalize_phone($client_phone);
-            $normalized_phone = $this->normalize_phone($phone);
+        // Попробуем поискать по последним 4 цифрам
+        $last_four_digits = substr($this->normalize_phone($phone), -4);
+        if (strlen($last_four_digits) === 4) {
+            $search_result = $this->search_client_api(['query' => $last_four_digits], $api_token);
             
-            // Сравниваем последние 10 цифр (на случай разных префиксов)
-            if (substr($normalized_client_phone, -10) === substr($normalized_phone, -10)) {
-                $this->log("Найден по телефону: {$client['id']}", 'info');
-                return $client['id'];
+            if (!empty($search_result)) {
+                $this->log("Найден клиент по последним 4 цифрам телефона: {$search_result[0]['id']}", 'debug');
+                return $search_result[0]['id'];
             }
         }
     }
     
-    $this->log("Клиент не найден после полной проверки", 'error');
+    // 2. Если есть email - пробуем искать по домену
+    if (!empty($email) && strpos($email, '@') !== false) {
+        $parts = explode('@', $email);
+        $domain = $parts[1];
+        
+        $search_result = $this->search_client_api(['query' => $domain], $api_token);
+        
+        if (!empty($search_result)) {
+            $this->log("Найден клиент по домену email: {$search_result[0]['id']}", 'debug');
+            return $search_result[0]['id'];
+        }
+    }
+    
+    // 3. Последний шанс - поиск по первым буквам имени/фамилии, если они указаны
+    if (isset($this->current_customer['firstName']) && isset($this->current_customer['lastName'])) {
+        $name_query = substr($this->current_customer['firstName'], 0, 3) . ' ' . 
+                     substr($this->current_customer['lastName'], 0, 3);
+        
+        $search_result = $this->search_client_api(['query' => $name_query], $api_token);
+        
+        if (!empty($search_result)) {
+            $this->log("Найден клиент по части имени: {$search_result[0]['id']}", 'debug');
+            return $search_result[0]['id'];
+        }
+    }
+    
+    $this->log("Клиент не найден после всех попыток поиска", 'error');
     return null;
 }
+
+/**
+ * Улучшенный поиск клиента по API с кешированием и повторными попытками
+ */
+private function search_client_api($params, $api_token, $retry = true) {
+    $cache_key = md5(json_encode($params));
+    static $cache = [];
+    
+    // Проверяем кеш
+    if (isset($cache[$cache_key])) {
+        return $cache[$cache_key];
+    }
+    
+    $curl = curl_init();
+    $query = http_build_query($params);
+    $url = "https://api.remonline.app/clients/?token=$api_token&$query";
+    
+    curl_setopt_array($curl, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTPHEADER => ["accept: application/json"],
+    ]);
+    
+    $response = curl_exec($curl);
+    $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    $curl_error = curl_error($curl);
+    curl_close($curl);
+    
+    // Обработка ошибок
+    if ($http_code == 401 && $retry) {
+        // Токен недействителен, обновляем и пробуем снова
+        $this->log("Токен недействителен, обновляем и повторяем запрос", 'info');
+        $new_token = $this->update_token();
+        
+        if ($new_token) {
+            return $this->search_client_api($params, $new_token, false); // Избегаем бесконечной рекурсии
+        }
+    }
+    
+    if ($http_code != 200) {
+        $this->log("Ошибка API при поиске клиента: HTTP код $http_code, Ошибка: $curl_error, URL: $url", 'error');
+        return [];
+    }
+    
+    $data = json_decode($response, true);
+    $result = $data['data'] ?? [];
+    
+    // Сохраняем в кеш
+    $cache[$cache_key] = $result;
+    
+    return $result;
+}
+
+/**
+ * Генерирует возможные варианты написания телефона для поиска
+ */
+private function generate_phone_variants($phone) {
+    $normalized = $this->normalize_phone($phone);
+    
+    $variants = [
+        $normalized,
+        '+' . $normalized,
+        '0' . substr($normalized, -9), // Для украинских номеров в формате 0XX XXX XX XX
+    ];
+    
+    // Добавляем вариант без первых цифр (без кода страны)
+    if (strlen($normalized) > 6) {
+        $variants[] = substr($normalized, -9);
+        $variants[] = substr($normalized, -10);
+    }
+    
+    // Добавляем варианты с разными кодами стран
+    if (strlen($normalized) >= 10) {
+        $last_ten = substr($normalized, -10);
+        $last_nine = substr($normalized, -9);
+        
+        $variants[] = '38' . $last_ten;
+        $variants[] = '380' . $last_nine;
+        $variants[] = '+38' . $last_ten;
+        $variants[] = '+380' . $last_nine;
+    }
+    
+    return array_unique($variants);
+}
+
 private function get_all_clients($api_token) {
     $all_clients = [];
     $page = 1;
@@ -1019,22 +1253,6 @@ private function search_client_by_exact_phone($phone, $api_token) {
     }
     
     return null;
-}
-
-
-
-private function generate_phone_variants($phone) {
-    $digits = preg_replace('/[^0-9]/', '', $phone);
-    
-    $variants = [
-        $digits,
-        '38' . $digits,
-        '+38' . $digits,
-        '380' . substr($digits, 2),
-        '0' . substr($digits, 2)
-    ];
-    
-    return array_unique($variants);
 }
 
 
@@ -1539,6 +1757,14 @@ add_action('rest_api_init', function () {
             return true; // будем проверять секретный ключ внутри функции
         }
     ));
+
+    register_rest_route('amelia-remonline/v1', '/update-datetime', array(
+        'methods' => 'POST',
+        'callback' => 'handle_remonline_datetime_update',
+        'permission_callback' => function () {
+            return true; // будем проверять секретный ключ внутри функции
+        }
+    ));
 });
 
 /**
@@ -1621,6 +1847,65 @@ function handle_remonline_status_update($request) {
 }
 
 /**
+ * Обработчик запросов на обновление даты и времени заказа из Remonline
+ */
+function handle_remonline_datetime_update($request) {
+    global $amelia_remonline_integration;
+    
+    $params = $request->get_params();
+    $amelia_remonline_integration->log("Получен запрос на обновление даты/времени: " . print_r($params, true), 'debug');
+    
+    // Проверка секретного ключа
+    if (empty($params['secret']) || $params['secret'] !== get_option('remonline_webhook_secret', '')) {
+        $amelia_remonline_integration->log("Неверный секретный ключ при попытке обновления даты", 'error');
+        return new WP_Error('invalid_secret', 'Неверный секретный ключ', array('status' => 403));
+    }
+    
+    // Проверяем наличие необходимых параметров
+    if (empty($params['orderId']) || empty($params['scheduledFor'])) {
+        $amelia_remonline_integration->log("Отсутствуют обязательные параметры: orderId или scheduledFor", 'error');
+        return new WP_Error('missing_params', 'Отсутствуют обязательные параметры', array('status' => 400));
+    }
+    
+    $remonline_order_id = $params['orderId'];
+    $scheduled_for = $params['scheduledFor']; // timestamp в миллисекундах
+    
+    $amelia_remonline_integration->log("Получен запрос на обновление даты для заказа Remonline #$remonline_order_id на $scheduled_for", 'info');
+    
+    // Ищем соответствующую запись в Amelia по внешнему ID (externalId)
+    global $wpdb;
+    $appointment_id = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}amelia_appointments WHERE externalId = %s",
+            $remonline_order_id
+        )
+    );
+    
+    if (!$appointment_id) {
+        $amelia_remonline_integration->log("Не найдена запись Amelia для заказа Remonline #$remonline_order_id", 'error');
+        return new WP_Error('appointment_not_found', 'Не найдена запись для данного заказа', array('status' => 404));
+    }
+    
+    // Обновляем дату и время бронирования в Amelia
+    $result = update_amelia_appointment_datetime($appointment_id, $scheduled_for);
+    
+    if ($result === false) {
+        $amelia_remonline_integration->log("Ошибка при обновлении даты для записи Amelia ID: $appointment_id", 'error');
+        return new WP_Error('update_failed', 'Ошибка при обновлении даты', array('status' => 500));
+    }
+    
+    $human_date = date('Y-m-d H:i:s', intval($scheduled_for) / 1000);
+    $amelia_remonline_integration->log("Успешно обновлена дата для записи Amelia ID: $appointment_id на '$human_date'", 'info');
+    
+    return array(
+        'success' => true,
+        'message' => "Дата записи #$appointment_id успешно обновлена на '$human_date'",
+        'appointment_id' => $appointment_id,
+        'remonline_order_id' => $remonline_order_id,
+    );
+}
+
+/**
  * Сопоставляет статусы Remonline и Amelia
  */
 function map_remonline_status_to_amelia($remonline_status_id) {
@@ -1671,6 +1956,75 @@ function update_amelia_appointment_status($appointment_id, $status) {
     }
     
     return false;
+}
+
+/**
+ * Обновляет дату и время записи в Amelia
+ */
+function update_amelia_appointment_datetime($appointment_id, $timestamp_ms) {
+    global $wpdb, $amelia_remonline_integration;
+    
+    // Проверки входных данных
+    if (empty($appointment_id) || empty($timestamp_ms) || !is_numeric($timestamp_ms)) {
+        $amelia_remonline_integration->log("Неверные параметры для обновления даты записи: ID=$appointment_id, timestamp=$timestamp_ms", 'error');
+        return false;
+    }
+    
+    // Конвертируем метку времени из миллисекунд в формат MySQL datetime
+    $timestamp_sec = intval($timestamp_ms) / 1000; // Из миллисекунд в секунды
+    $mysql_datetime = date('Y-m-d H:i:s', $timestamp_sec);
+    
+    $amelia_remonline_integration->log("Обновление времени записи ID: $appointment_id на $mysql_datetime (из timestamp: $timestamp_ms)", 'debug');
+    
+    // Получаем текущие данные записи
+    $appointment = $wpdb->get_row(
+        $wpdb->prepare("SELECT * FROM {$wpdb->prefix}amelia_appointments WHERE id = %d", $appointment_id),
+        ARRAY_A
+    );
+    
+    if (!$appointment) {
+        $amelia_remonline_integration->log("Не найдена запись с ID: $appointment_id для обновления времени", 'error');
+        return false;
+    }
+    
+    // Рассчитываем продолжительность записи
+    $duration = isset($appointment['duration']) ? intval($appointment['duration']) : 0;
+    if ($duration <= 0) {
+        // Если длительность не указана, попробуем получить её из связанной услуги
+        if (isset($appointment['serviceId'])) {
+            $service_duration = $wpdb->get_var(
+                $wpdb->prepare("SELECT duration FROM {$wpdb->prefix}amelia_services WHERE id = %d", $appointment['serviceId'])
+            );
+            $duration = $service_duration ? intval($service_duration) : 60; // По умолчанию 60 минут
+        } else {
+            $duration = 60; // По умолчанию 60 минут
+        }
+    }
+    
+    // Рассчитываем время окончания
+    $end_datetime = date('Y-m-d H:i:s', $timestamp_sec + ($duration * 60));
+    
+    // Обновляем запись в базе данных
+    $result = $wpdb->update(
+        $wpdb->prefix . 'amelia_appointments',
+        array(
+            'bookingStart' => $mysql_datetime,
+            'bookingEnd' => $end_datetime
+        ),
+        array('id' => $appointment_id)
+    );
+    
+    if ($result === false) {
+        $amelia_remonline_integration->log("Ошибка при обновлении времени записи: " . $wpdb->last_error, 'error');
+        return false;
+    }
+    
+    $amelia_remonline_integration->log("Успешно обновлено время записи ID: $appointment_id на $mysql_datetime", 'info');
+    
+    // Вызываем хук Amelia для уведомления об изменении расписания
+    do_action('amelia_appointment_time_updated', $appointment_id, $mysql_datetime, $end_datetime);
+    
+    return true;
 }
 
 // Добавляем новое поле в настройки плагина для секретного ключа вебхука
