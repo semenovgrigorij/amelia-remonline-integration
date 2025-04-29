@@ -1970,11 +1970,27 @@ function update_amelia_appointment_datetime($appointment_id, $timestamp_ms) {
         return false;
     }
     
-    // Конвертируем метку времени из миллисекунд в формат MySQL datetime
-    $timestamp_sec = intval($timestamp_ms) / 1000; // Из миллисекунд в секунды
-    $mysql_datetime = date('Y-m-d H:i:s', $timestamp_sec);
+    // Конвертируем метку времени из миллисекунд в секунды
+    $timestamp_sec = intval($timestamp_ms) / 1000;
+    
+    // Получаем часовой пояс WordPress
+    $timezone_string = get_option('timezone_string');
+    $timezone = new DateTimeZone($timezone_string ?: 'UTC');
+    
+    // Преобразуем timestamp в DateTime и устанавливаем часовой пояс
+    $date = new DateTime('@' . $timestamp_sec);
+    $date->setTimezone($timezone);
+    
+    // Форматируем дату в MySQL формат с учетом часового пояса
+    $mysql_datetime = $date->format('Y-m-d H:i:s');
     
     $amelia_remonline_integration->log("Обновление времени записи ID: $appointment_id на $mysql_datetime (из timestamp: $timestamp_ms)", 'debug');
+    $amelia_remonline_integration->log(
+        "Преобразование времени: timestamp=$timestamp_ms, UTC=" . gmdate('Y-m-d H:i:s', $timestamp_sec) . 
+        ", Local=" . date('Y-m-d H:i:s', $timestamp_sec) . 
+        ", WordPress timezone=" . $timezone_string,
+        'debug'
+    );
     
     // Получаем текущие данные записи
     $appointment = $wpdb->get_row(
@@ -2001,8 +2017,10 @@ function update_amelia_appointment_datetime($appointment_id, $timestamp_ms) {
         }
     }
     
-    // Рассчитываем время окончания
-    $end_datetime = date('Y-m-d H:i:s', $timestamp_sec + ($duration * 60));
+    // Создаем копию даты для времени окончания и добавляем продолжительность
+    $end_date = clone $date;
+    $end_date->add(new DateInterval('PT' . $duration . 'M')); // PT60M = 60 минут
+    $end_datetime = $end_date->format('Y-m-d H:i:s');
     
     // Обновляем запись в базе данных
     $result = $wpdb->update(
@@ -2019,7 +2037,7 @@ function update_amelia_appointment_datetime($appointment_id, $timestamp_ms) {
         return false;
     }
     
-    $amelia_remonline_integration->log("Успешно обновлено время записи ID: $appointment_id на $mysql_datetime", 'info');
+    $amelia_remonline_integration->log("Успешно обновлено время записи ID: $appointment_id на $mysql_datetime (окончание: $end_datetime)", 'info');
     
     // Вызываем хук Amelia для уведомления об изменении расписания
     do_action('amelia_appointment_time_updated', $appointment_id, $mysql_datetime, $end_datetime);
