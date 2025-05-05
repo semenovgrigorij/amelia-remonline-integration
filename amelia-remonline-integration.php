@@ -880,43 +880,32 @@ public function handle_appointment_created($appointmentId, $appointmentData)
  */
 
  private function get_remonline_client($customer, $api_token) {
-    // 1. Нормализация данных клиента
-    $email = !empty($customer['email']) ? strtolower(trim($customer['email'])) : '';
-    $phone = !empty($customer['phone']) ? $this->normalize_phone($customer['phone']) : '';
-    $first_name = !empty($customer['firstName']) ? trim($customer['firstName']) : '';
-    $last_name = !empty($customer['lastName']) ? trim($customer['lastName']) : '';
+    // 1. Нормализация данных
+    $email = strtolower(trim($customer['email'] ?? ''));
+    $phone = $this->normalize_phone($customer['phone'] ?? '');
     
-    // Подробное логирование для отладки
-    $this->log("=== ПОИСК КЛИЕНТА ===", 'debug');
-    $this->log("Email: '$email', Phone: '$phone', Имя: '$first_name', Фамилия: '$last_name'", 'debug');
+    // 2. Логирование входящих данных
+    $this->log("Поиск клиента. Email: '$email', Phone: '$phone'", 'debug');
     
-    // 2. Проверяем наличие необходимых данных для поиска
-    if (empty($email) && empty($phone)) {
-        $this->log("ОШИБКА: Не указаны ни email, ни телефон для поиска клиента", 'error');
-        return null;
-    }
-    
-    // 3. Поиск существующего клиента с точной проверкой
+    // 3. Поиск существующего клиента с полной проверкой
     $client_id = $this->find_client_with_full_check($email, $phone, $api_token);
     
-    // 4. Если нашли существующего клиента, возвращаем его ID
     if ($client_id) {
-        $this->log("НАЙДЕН существующий клиент ID: $client_id", 'info');
+        $this->log("Найден существующий клиент ID: $client_id", 'info');
         return $client_id;
     }
     
-    // 5. Если клиент не найден, создаем нового клиента
-    $this->log("Клиент не найден, создаем нового клиента", 'info');
+    // 4. Попытка создания нового клиента с обработкой ошибок
+    $this->log("Попытка создать нового клиента", 'info');
     $new_client_id = $this->create_remonline_client($customer, $api_token);
     
     if ($new_client_id) {
-        $this->log("СОЗДАН новый клиент ID: $new_client_id", 'info');
         return $new_client_id;
     }
     
-    // 6. Если не удалось создать клиента, это ошибка
-    $this->log("ОШИБКА: Не удалось создать нового клиента", 'error');
-    return null;
+    // 5. Последняя попытка найти клиента с полным перебором
+    $this->log("Финальная попытка найти клиента", 'info');
+    return $this->ultimate_client_search($email, $phone, $api_token);
 }
 
 private function find_exact_client_match($email, $phone, $api_token) {
@@ -994,195 +983,7 @@ private function deep_client_search($email, $phone, $api_token) {
     return null;
 }
 
-/**
- *  Функция нормализации телефонного номера
- */
-private function normalize_phone($phone) {
-    // Удаляем все нецифровые символы
-    $digits = preg_replace('/[^0-9]/', '', $phone);
-    
-    // Если номер начинается с 0 и его длина 10 символов (стандартный украинский номер)
-    if (strlen($digits) === 10 && substr($digits, 0, 1) === '0') {
-        return '38' . $digits;
-    }
-    
-    // Если это номер без кода страны (9 цифр)
-    if (strlen($digits) === 9) {
-        return '380' . $digits;
-    }
-    
-    // Если это 12-значный номер с кодом страны
-    if (strlen($digits) === 12 && substr($digits, 0, 3) === '380') {
-        return $digits;
-    }
-    
-    // Если это 11-значный номер (возможно российский формат)
-    if (strlen($digits) === 11 && substr($digits, 0, 1) === '7') {
-        // Оставляем как есть, это российский формат
-        return $digits;
-    }
-    
-    // В остальных случаях возвращаем как есть
-    return $digits;
-}
-
-/**
- *  Поиск клиента по email и телефону с точным сравнением параметров
- */
-
-private function find_client_with_full_check($email, $phone, $api_token) {
-    // Логирование входных параметров для отладки
-    $this->log("Поиск клиента, нормализованные параметры: email='$email', phone='$phone'", 'debug');
-    
-    // Проверяем наличие необходимых параметров для поиска
-    if (empty($email) && empty($phone)) {
-        $this->log("Невозможно выполнить поиск клиента: не указаны ни email, ни телефон", 'error');
-        return null;
-    }
-    
-    // Формируем параметры для поиска
-    $search_params = [];
-    if (!empty($email)) $search_params['email'] = $email;
-    if (!empty($phone)) $search_params['phone'] = $phone;
-    
-    // Поиск клиентов по точным параметрам
-    $found_clients = $this->search_client_api($search_params, $api_token);
-    $this->log("Найдено клиентов по параметрам: " . count($found_clients), 'debug');
-    
-    // Если нашли результаты, проверяем на ТОЧНОЕ совпадение
-    if (!empty($found_clients)) {
-        foreach ($found_clients as $client) {
-            // Проверка на точное совпадение email
-            $email_match = false;
-            if (!empty($email) && !empty($client['email'])) {
-                $client_email = strtolower(trim($client['email']));
-                $email_match = ($client_email === $email);
-                $this->log("Сравнение email: клиент='$client_email', искомый='$email', совпадение=" . ($email_match ? "да" : "нет"), 'debug');
-            }
-            
-            // Проверка на точное совпадение телефона
-            $phone_match = false;
-            if (!empty($phone) && isset($client['phone']) && is_array($client['phone'])) {
-                foreach ($client['phone'] as $client_phone) {
-                    $normalized_client_phone = $this->normalize_phone($client_phone);
-                    $phone_match = ($normalized_client_phone === $phone);
-                    
-                    $this->log("Сравнение телефона: клиент='$normalized_client_phone', искомый='$phone', совпадение=" . ($phone_match ? "да" : "нет"), 'debug');
-                    
-                    if ($phone_match) break;
-                }
-            }
-            
-            // Если есть точное совпадение по email ИЛИ телефону
-            if ($email_match || $phone_match) {
-                $this->log("ТОЧНОЕ СОВПАДЕНИЕ найдено для клиента ID: {$client['id']}", 'info');
-                return $client['id'];
-            }
-        }
-        
-        // Если не нашли точных совпадений, проверяем по части телефона (последние 9 цифр)
-        if (!empty($phone)) {
-            $last_nine_digits = substr($phone, -9);
-            
-            foreach ($found_clients as $client) {
-                if (isset($client['phone']) && is_array($client['phone'])) {
-                    foreach ($client['phone'] as $client_phone) {
-                        $normalized_client_phone = $this->normalize_phone($client_phone);
-                        $last_nine_client = substr($normalized_client_phone, -9);
-                        
-                        if ($last_nine_digits === $last_nine_client) {
-                            $this->log("Совпадение по последним 9 цифрам для клиента ID: {$client['id']}", 'info');
-                            return $client['id'];
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Если совпадений не найдено, логируем это
-    $this->log("Точных совпадений клиента не найдено", 'info');
-    return null;
-}
-
-/**
- * Последняя попытка поиска клиента, используя более агрессивные методы
- */
-private function ultimate_client_search($email, $phone, $api_token) {
-    // 1. Проверяем, есть ли результаты по частичному совпадению телефона
-    if (!empty($phone)) {
-        $phone_variants = $this->generate_phone_variants($phone);
-        
-        foreach ($phone_variants as $variant) {
-            // Ищем по каждому варианту телефона
-            $search_result = $this->search_client_api(['query' => $variant], $api_token);
-            
-            if (!empty($search_result)) {
-                $this->log("Найден клиент по варианту телефона: {$search_result[0]['id']}", 'debug');
-                return $search_result[0]['id'];
-            }
-        }
-        
-        // Попробуем поискать по последним 4 цифрам
-        $last_four_digits = substr($this->normalize_phone($phone), -4);
-        if (strlen($last_four_digits) === 4) {
-            $search_result = $this->search_client_api(['query' => $last_four_digits], $api_token);
-            
-            if (!empty($search_result)) {
-                $this->log("Найден клиент по последним 4 цифрам телефона: {$search_result[0]['id']}", 'debug');
-                return $search_result[0]['id'];
-            }
-        }
-    }
-    
-    // 2. Если есть email - пробуем искать по домену
-    if (!empty($email) && strpos($email, '@') !== false) {
-        $parts = explode('@', $email);
-        $domain = $parts[1];
-        
-        $search_result = $this->search_client_api(['query' => $domain], $api_token);
-        
-        if (!empty($search_result)) {
-            $this->log("Найден клиент по домену email: {$search_result[0]['id']}", 'debug');
-            return $search_result[0]['id'];
-        }
-    }
-    
-    // 3. Последний шанс - поиск по первым буквам имени/фамилии, если они указаны
-    if (isset($this->current_customer['firstName']) && isset($this->current_customer['lastName'])) {
-        $name_query = substr($this->current_customer['firstName'], 0, 3) . ' ' . 
-                     substr($this->current_customer['lastName'], 0, 3);
-        
-        $search_result = $this->search_client_api(['query' => $name_query], $api_token);
-        
-        if (!empty($search_result)) {
-            $this->log("Найден клиент по части имени: {$search_result[0]['id']}", 'debug');
-            return $search_result[0]['id'];
-        }
-    }
-    
-    $this->log("Клиент не найден после всех попыток поиска", 'error');
-    return null;
-}
-
-/**
- * Улучшенный поиск клиентов через API Remonline 
- * с корректной обработкой ошибок и результатов
- */
-private function search_client_api($params, $api_token, $retry = true) {
-    // Кеширование результатов для оптимизации
-    $cache_key = md5(json_encode($params));
-    static $cache = [];
-    
-    // Проверяем кеш
-    if (isset($cache[$cache_key])) {
-        $this->log("Использование кешированного результата поиска клиентов", 'debug');
-        return $cache[$cache_key];
-    }
-    
-    // Логирование запроса
-    $this->log("API запрос на поиск клиентов с параметрами: " . json_encode($params), 'debug');
-    
+private function search_client_api($params, $api_token) {
     $curl = curl_init();
     $query = http_build_query($params);
     $url = "https://api.remonline.app/clients/?token=$api_token&$query";
@@ -1196,76 +997,98 @@ private function search_client_api($params, $api_token, $retry = true) {
     
     $response = curl_exec($curl);
     $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    $curl_error = curl_error($curl);
     curl_close($curl);
     
-    // Обработка HTTP-ошибок
     if ($http_code != 200) {
-        $this->log("Ошибка API при поиске клиента: HTTP код $http_code, Ошибка: $curl_error", 'error');
+        $this->log("Ошибка API: $http_code, URL: $url", 'error');
+        return [];
+    }
+    
+    $data = json_decode($response, true);
+    return $data['data'] ?? [];
+}
+private function normalize_phone($phone) {
+    // Удаляем все нецифровые символы
+    $digits = preg_replace('/[^0-9]/', '', $phone);
+    
+    // Приводим к формату 380XXXXXXXXX
+    if (strlen($digits) === 10 && $digits[0] === '0') {
+        return '38' . substr($digits, 1);
+    }
+    
+    if (strlen($digits) === 9) {
+        return '380' . $digits;
+    }
+    
+    return $digits;
+}
+
+private function find_client_with_full_check($email, $phone, $api_token) {
+    // Получаем всех клиентов
+    $all_clients = $this->get_all_clients($api_token);
+    
+    foreach ($all_clients as $client) {
+        // Проверка email
+        $client_email = strtolower(trim($client['email'] ?? ''));
+        $email_match = !empty($email) && $client_email === $email;
         
-        // Если токен недействителен, обновляем и пробуем снова
-        if ($http_code == 401 && $retry) {
-            $this->log("Токен недействителен, обновляем...", 'info');
-            $new_token = $this->update_token();
-            
-            if ($new_token) {
-                $this->log("Токен обновлен, повторяем запрос", 'info');
-                return $this->search_client_api($params, $new_token, false);
+        // Проверка телефона
+        $phone_match = false;
+        $client_phones = $client['phone'] ?? [];
+        
+        foreach ($client_phones as $client_phone) {
+            if ($this->normalize_phone($client_phone) === $phone) {
+                $phone_match = true;
+                break;
             }
         }
         
-        return [];
+        // Если найдено совпадение
+        if ($email_match || $phone_match) {
+            $this->log("Точное совпадение с клиентом ID: {$client['id']}", 'debug');
+            $this->log("Данные клиента: " . json_encode([
+                'id' => $client['id'],
+                'name' => $client['name'] ?? '',
+                'email' => $client_email,
+                'phones' => $client_phones
+            ]), 'debug');
+            
+            return $client['id'];
+        }
     }
-    // Обработка ответа API
-    $data = json_decode($response, true);
     
-    // Проверка структуры ответа
-    if (!is_array($data) || !isset($data['data']) || !is_array($data['data'])) {
-        $this->log("Некорректный формат ответа API: " . substr($response, 0, 100) . "...", 'error');
-        return [];
-    }
- 
-    $result = $data['data'];
-    $this->log("Получено клиентов: " . count($result), 'debug');
- 
-    // Сохраняем в кеш
-    $cache[$cache_key] = $result;
- 
-    return $result;
+    return null;
 }
 
-/**
- * Генерирует возможные варианты написания телефона для поиска
- */
-private function generate_phone_variants($phone) {
-    $normalized = $this->normalize_phone($phone);
+private function ultimate_client_search($email, $phone, $api_token) {
+    $all_clients = $this->get_all_clients($api_token);
     
-    $variants = [
-        $normalized,
-        '+' . $normalized,
-        '0' . substr($normalized, -9), // Для украинских номеров в формате 0XX XXX XX XX
-    ];
-    
-    // Добавляем вариант без первых цифр (без кода страны)
-    if (strlen($normalized) > 6) {
-        $variants[] = substr($normalized, -9);
-        $variants[] = substr($normalized, -10);
-    }
-    
-    // Добавляем варианты с разными кодами стран
-    if (strlen($normalized) >= 10) {
-        $last_ten = substr($normalized, -10);
-        $last_nine = substr($normalized, -9);
+    foreach ($all_clients as $client) {
+        // Проверка email (без учета пустых значений)
+        if (!empty($email)) {
+            $client_email = strtolower(trim($client['email'] ?? ''));
+            if ($client_email === $email) {
+                $this->log("Найден по email: {$client['id']}", 'info');
+                return $client['id'];
+            }
+        }
         
-        $variants[] = '38' . $last_ten;
-        $variants[] = '380' . $last_nine;
-        $variants[] = '+38' . $last_ten;
-        $variants[] = '+380' . $last_nine;
+        // Проверка всех вариантов телефона
+        foreach ($client['phone'] ?? [] as $client_phone) {
+            $normalized_client_phone = $this->normalize_phone($client_phone);
+            $normalized_phone = $this->normalize_phone($phone);
+            
+            // Сравниваем последние 10 цифр (на случай разных префиксов)
+            if (substr($normalized_client_phone, -10) === substr($normalized_phone, -10)) {
+                $this->log("Найден по телефону: {$client['id']}", 'info');
+                return $client['id'];
+            }
+        }
     }
     
-    return array_unique($variants);
+    $this->log("Клиент не найден после полной проверки", 'error');
+    return null;
 }
-
 private function get_all_clients($api_token) {
     $all_clients = [];
     $page = 1;
@@ -1294,6 +1117,22 @@ private function search_client_by_exact_phone($phone, $api_token) {
     }
     
     return null;
+}
+
+
+
+private function generate_phone_variants($phone) {
+    $digits = preg_replace('/[^0-9]/', '', $phone);
+    
+    $variants = [
+        $digits,
+        '38' . $digits,
+        '+38' . $digits,
+        '380' . substr($digits, 2),
+        '0' . substr($digits, 2)
+    ];
+    
+    return array_unique($variants);
 }
 
 
@@ -1370,7 +1209,7 @@ private function search_client_by_exact_phone($phone, $api_token) {
 
         return null;
     }
-
+    
     /**
      * Создает заказ в Remonline API
      */
